@@ -21,6 +21,7 @@ export interface WritingTrackerSettings {
       dailyProgress: number;
       totalProgress: number;
       initialWordCount: number;
+      previousWordCount?: number;
     };
   };
 }
@@ -144,6 +145,7 @@ export default class WritingTrakcerPlugin extends Plugin {
         dailyProgress: 0,
         totalProgress: 0,
         initialWordCount,
+        previousWordCount: initialWordCount, // Initialize this here
       },
     };
     this.settings.writingGoals = goals;
@@ -197,43 +199,55 @@ export default class WritingTrakcerPlugin extends Plugin {
     }
   }
 
-  private updateWordCountDebounced = debounce(
-    async (file: TAbstractFile | null, goal: any, folderPath?: string) => {
-      console.log("update words");
-      if (file instanceof TFile) {
-        const content = await this.app.vault.read(file);
-        const currentWordCount = content.trim().split(/\s+/).length;
-        const newWordCount = currentWordCount - goal.initialWordCount;
+  // private updateWordCountDebounced = (
+  async updateWordCountDebounced(
+    file: TAbstractFile | null,
+    goal: any,
+    folderPath?: string,
+  ) {
+    if (file instanceof TFile) {
+      const content = await this.app.vault.read(file);
+      const currentWordCount = content.trim().split(/\s+/).length;
+      const previousWordCount = goal.previousWordCount || goal.initialWordCount;
+      const wordCountChange = currentWordCount - previousWordCount;
+      console.log(`File: ${file.path}`);
+      console.log(`Previous Word Count: ${previousWordCount}`);
+      console.log(`Current Word Count: ${currentWordCount}`);
+      console.log(`Word Count Change: ${wordCountChange}`);
 
-        if (folderPath) {
-          const filesInFolder = this.app.vault
-            .getMarkdownFiles()
-            .filter((f) => f.parent.path === folderPath);
-          const totalNewWordCount = await Promise.all(
-            filesInFolder.map(async (f) => {
-              const content = await this.app.vault.read(f);
-              const currentWordCount = content.trim().split(/\s+/).length;
-              const goalForFile = this.settings.writingGoals[f.path];
-              return goalForFile
-                ? currentWordCount - goalForFile.initialWordCount
-                : 0;
-            }),
-          );
-          const sumNewWordCount = totalNewWordCount.reduce(
-            (sum, count) => sum + count,
-            0,
-          );
-          goal.dailyProgress = sumNewWordCount;
-          goal.totalProgress += sumNewWordCount;
-        } else {
-          goal.dailyProgress = newWordCount;
-          goal.totalProgress += newWordCount;
-        }
+      if (folderPath) {
+        const filesInFolder = this.app.vault
+          .getMarkdownFiles()
+          .filter((f) => f.parent.path === folderPath);
+        const totalNewWordCount = await Promise.all(
+          filesInFolder.map(async (f) => {
+            const content = await this.app.vault.read(f);
+            const currentWordCount = content.trim().split(/\s+/).length;
+            const goalForFile = this.settings.writingGoals[f.path];
+            return goalForFile
+              ? currentWordCount - goalForFile.initialWordCount
+              : 0;
+          }),
+        );
+        const sumNewWordCount = totalNewWordCount.reduce(
+          (sum, count) => sum + count,
+          0,
+        );
+        const changeInWordCount = sumNewWordCount - goal.dailyProgress;
+        goal.dailyProgress = sumNewWordCount;
+        goal.totalProgress += changeInWordCount;
+      } else {
+        goal.dailyProgress += wordCountChange;
+        goal.totalProgress += wordCountChange;
       }
-      await this.saveSettings();
-    },
-    1000,
-  );
+
+      goal.previousWordCount = currentWordCount;
+    }
+    await this.saveSettings();
+  }
+  // },
+  //   1000,
+  // );
 
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
