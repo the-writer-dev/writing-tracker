@@ -1,134 +1,477 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import Chart from "chart.js/auto";
+import { debounce } from "lodash";
+import {
+  App,
+  FuzzySuggestModal,
+  ItemView,
+  Modal,
+  Plugin,
+  Setting,
+  TAbstractFile,
+  TFile,
+  WorkspaceLeaf,
+} from "obsidian";
 
-// Remember to rename these classes and interfaces!
-
-interface MyPluginSettings {
-	mySetting: string;
+export interface WritingTrackerSettings {
+  mySetting: string;
+  writingGoals: {
+    [key: string]: {
+      dailyGoal: number;
+      totalGoal: number;
+      dailyProgress: number;
+      totalProgress: number;
+      initialWordCount: number;
+    };
+  };
 }
 
-const DEFAULT_SETTINGS: MyPluginSettings = {
-	mySetting: 'default'
+export const DEFAULT_SETTINGS: WritingTrackerSettings = {
+  mySetting: "default",
+  writingGoals: {},
+};
+export default class WritingTrakcerPlugin extends Plugin {
+  settings: WritingTrackerSettings;
+
+  async onload() {
+    await this.loadSettings();
+
+    this.registerView("writing-tracker-view", (leaf) => {
+      return new WritingTrackerView(leaf, this);
+    });
+
+    this.addCommand({
+      id: "open-writing-tracker-view",
+      name: "Open Writing Tracker View",
+      callback: () => {
+        this.activateView();
+      },
+    });
+
+    this.addCommand({
+      id: "clear-all-writing-goals",
+      name: "Clear All Writing Goals",
+      callback: () => {
+        this.clearAllWritingGoals();
+      },
+    });
+
+    this.addCommand({
+      id: "remove-writing-goal",
+      name: "Remove Writing Goal",
+      callback: async () => {
+        const fileOrFolderPath = await this.promptForFileOrFolder();
+        if (fileOrFolderPath) {
+          await this.removeWritingGoal(fileOrFolderPath);
+        }
+      },
+    });
+
+    // Add the writing goal to the file menu
+    this.registerEvent(
+      this.app.workspace.on("file-menu", (menu, file) => {
+        menu.addItem((item) => {
+          item
+            .setTitle("Set Writing Goals")
+            .setIcon("pencil")
+            .onClick(async () => {
+              this.setWritingGoals(file);
+            });
+        });
+      }),
+    );
+
+    // Remove the writing goal from the file menu
+    this.registerEvent(
+      this.app.workspace.on("file-menu", (menu, file) => {
+        menu.addItem((item) => {
+          item
+            .setTitle("Remove Writing Goal")
+            .setIcon("cross")
+            .onClick(async () => {
+              await this.removeWritingGoal(file.path);
+            });
+        });
+      }),
+    );
+
+    // Listen to changes in the vault and update word counts
+    this.registerEvent(
+      this.app.vault.on("modify", (file) => this.updateWordCount(file)),
+    );
+  }
+
+  async activateView() {
+    this.app.workspace.detachLeavesOfType("writing-tracker-view");
+
+    await this.app.workspace.getRightLeaf(false).setViewState({
+      type: "writing-tracker-view",
+      active: true,
+    });
+  }
+
+  async setWritingGoals(file: any) {
+    const fileOrFolderPath = file.path;
+
+    const modal = new WritingGoalModal(this.app, fileOrFolderPath);
+    modal.onClose = async () => {
+      if (modal.saved) {
+        const { dailyGoal, totalGoal } = modal.getData();
+        await this.saveWritingGoals(fileOrFolderPath, dailyGoal, totalGoal);
+      }
+    };
+
+    modal.open();
+  }
+
+  async saveWritingGoals(
+    fileOrFolderPath: string,
+    dailyGoal: number,
+    totalGoal: number,
+  ) {
+    // Count the number of words in the file or folder before starting the goals
+    const abstractFile = this.app.vault.getAbstractFileByPath(fileOrFolderPath);
+    const content =
+      fileOrFolderPath.endsWith(".md") && abstractFile instanceof TFile
+        ? await this.app.vault.read(abstractFile)
+        : null;
+    const initialWordCount = content ? content.trim().split(/\s+/).length : 0;
+
+    const goals = {
+      ...this.settings.writingGoals,
+      [fileOrFolderPath]: {
+        dailyGoal,
+        totalGoal,
+        dailyProgress: 0,
+        totalProgress: 0,
+        initialWordCount,
+      },
+    };
+    this.settings.writingGoals = goals;
+    await this.saveSettings();
+  }
+
+  async clearAllWritingGoals() {
+    this.settings.writingGoals = {};
+    await this.saveSettings();
+  }
+
+  async removeWritingGoal(fileOrFolderPath: string) {
+    if (fileOrFolderPath) {
+      delete this.settings.writingGoals[fileOrFolderPath];
+      await this.saveSettings();
+    }
+  }
+
+  async promptForFileOrFolder(): Promise<string | null> {
+    const allLoadedFiles = this.app.vault.getAllLoadedFiles();
+    const folders = allLoadedFiles
+      .filter((file) => file.parent && file.parent.path !== "/")
+      .map((file) => file.parent.path);
+
+    const fileOrFolderPath = [
+      ...new Set(allLoadedFiles.map((file) => file.path).concat(folders)),
+    ];
+    const selectedPath = await new Promise<string | null>((resolve) => {
+      const modal = new SuggestModal(this.app, fileOrFolderPath);
+      modal.onChoose = (item) => {
+        resolve(item);
+      };
+      modal.open();
+    });
+    return selectedPath;
+  }
+
+  async updateWordCount(file: TAbstractFile) {
+    if (file instanceof TFile) {
+      const fileOrFolderPath = file.path;
+      const goal = this.settings.writingGoals[fileOrFolderPath];
+      if (goal) {
+        this.updateWordCountDebounced(file, goal);
+      } else {
+        const folderPath = file.parent.path;
+        const folderGoal = this.settings.writingGoals[folderPath];
+        if (folderGoal) {
+          this.updateWordCountDebounced(null, folderGoal, folderPath);
+        }
+      }
+    }
+  }
+
+  private updateWordCountDebounced = debounce(
+    async (file: TAbstractFile | null, goal: any, folderPath?: string) => {
+      console.log("update words");
+      if (file instanceof TFile) {
+        const content = await this.app.vault.read(file);
+        const currentWordCount = content.trim().split(/\s+/).length;
+        const newWordCount = currentWordCount - goal.initialWordCount;
+
+        if (folderPath) {
+          const filesInFolder = this.app.vault
+            .getMarkdownFiles()
+            .filter((f) => f.parent.path === folderPath);
+          const totalNewWordCount = await Promise.all(
+            filesInFolder.map(async (f) => {
+              const content = await this.app.vault.read(f);
+              const currentWordCount = content.trim().split(/\s+/).length;
+              const goalForFile = this.settings.writingGoals[f.path];
+              return goalForFile
+                ? currentWordCount - goalForFile.initialWordCount
+                : 0;
+            }),
+          );
+          const sumNewWordCount = totalNewWordCount.reduce(
+            (sum, count) => sum + count,
+            0,
+          );
+          goal.dailyProgress = sumNewWordCount;
+          goal.totalProgress += sumNewWordCount;
+        } else {
+          goal.dailyProgress = newWordCount;
+          goal.totalProgress += newWordCount;
+        }
+      }
+      await this.saveSettings();
+    },
+    1000,
+  );
+
+  async loadSettings() {
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+  }
+
+  async saveSettings() {
+    await this.saveData(this.settings);
+    this.onSettingsChanged();
+  }
+
+  async onSettingsChanged() {
+    this.app.workspace.trigger(
+      "writing-tracker-view:settings-changed",
+      this.settings.writingGoals,
+    );
+  }
 }
 
-export default class MyPlugin extends Plugin {
-	settings: MyPluginSettings;
+export class SuggestModal extends FuzzySuggestModal<string> {
+  constructor(
+    app: App,
+    private items: string[],
+  ) {
+    super(app);
+  }
 
-	async onload() {
-		await this.loadSettings();
+  getItems(): string[] {
+    return this.items;
+  }
 
-		// This creates an icon in the left ribbon.
-		const ribbonIconEl = this.addRibbonIcon('dice', 'Sample Plugin', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
-		});
-		// Perform additional things with the ribbon
-		ribbonIconEl.addClass('my-plugin-ribbon-class');
+  getItemText(item: string): string {
+    return item;
+  }
 
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status Bar Text');
+  onChooseItem(item: string, evt: MouseEvent | KeyboardEvent): void {
+    this.close();
+    this.onChoose(item);
+  }
 
-		// This adds a simple command that can be triggered anywhere
-		this.addCommand({
-			id: 'open-sample-modal-simple',
-			name: 'Open sample modal (simple)',
-			callback: () => {
-				new SampleModal(this.app).open();
-			}
-		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'sample-editor-command',
-			name: 'Sample editor command',
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				console.log(editor.getSelection());
-				editor.replaceSelection('Sample Editor Command');
-			}
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-sample-modal-complex',
-			name: 'Open sample modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
-					}
-
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
-				}
-			}
-		});
-
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
-
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-			console.log('click', evt);
-		});
-
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
-	}
-
-	onunload() {
-
-	}
-
-	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-	}
-
-	async saveSettings() {
-		await this.saveData(this.settings);
-	}
+  onChoose: (item: string) => void;
 }
 
-class SampleModal extends Modal {
-	constructor(app: App) {
-		super(app);
-	}
+export class WritingGoalModal extends Modal {
+  saved: boolean;
+  dailyGoal: number;
+  totalGoal: number;
 
-	onOpen() {
-		const {contentEl} = this;
-		contentEl.setText('Woah!');
-	}
+  constructor(
+    app: App,
+    public fileOrFolderPath: string,
+  ) {
+    super(app);
+    this.saved = false;
+    this.dailyGoal = 0;
+    this.totalGoal = 0;
+  }
 
-	onClose() {
-		const {contentEl} = this;
-		contentEl.empty();
-	}
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.createEl("h2", { text: "Set Writing Goals" });
+
+    new Setting(contentEl).setName("Daily Goal").addText((text) => {
+      text.setValue(this.dailyGoal.toString());
+      text.onChange((value) => {
+        this.dailyGoal = parseInt(value, 10);
+      });
+    });
+
+    new Setting(contentEl).setName("Total Goal").addText((text) => {
+      text.setValue(this.totalGoal.toString());
+      text.onChange((value) => {
+        this.totalGoal = parseInt(value, 10);
+      });
+    });
+
+    new Setting(contentEl)
+      .addButton((btn) => {
+        btn
+          .setButtonText("Save")
+          .setCta()
+          .onClick(() => {
+            this.saved = true;
+            this.close();
+          });
+      })
+      .addButton((btn) => {
+        btn.setButtonText("Cancel").onClick(() => this.close());
+      });
+  }
+
+  getData() {
+    return {
+      dailyGoal: this.dailyGoal,
+      totalGoal: this.totalGoal,
+    };
+  }
 }
 
-class SampleSettingTab extends PluginSettingTab {
-	plugin: MyPlugin;
+export class WritingTrackerView extends ItemView {
+  private goals: {
+    [key: string]: {
+      dailyGoal: number;
+      totalGoal: number;
+      dailyProgress: number;
+      totalProgress: number;
+      initialWordCount: number;
+    };
+  } = {};
 
-	constructor(app: App, plugin: MyPlugin) {
-		super(app, plugin);
-		this.plugin = plugin;
-	}
+  private chart: Chart | null = null;
+  private plugin: WritingTrakcerPlugin;
 
-	display(): void {
-		const {containerEl} = this;
+  constructor(leaf: WorkspaceLeaf, plugin: WritingTrakcerPlugin) {
+    super(leaf);
+    this.plugin = plugin;
+    this.goals = plugin.settings.writingGoals;
 
-		containerEl.empty();
+    this.registerEvent(
+      this.app.workspace.on(
+        "writing-tracker-view:settings-changed",
+        this.onSettingsChanged.bind(this),
+      ),
+    );
+  }
 
-		new Setting(containerEl)
-			.setName('Setting #1')
-			.setDesc('It\'s a secret')
-			.addText(text => text
-				.setPlaceholder('Enter your secret')
-				.setValue(this.plugin.settings.mySetting)
-				.onChange(async (value) => {
-					this.plugin.settings.mySetting = value;
-					await this.plugin.saveSettings();
-				}));
-	}
+  getViewType(): string {
+    return "writing-tracker-view";
+  }
+
+  getDisplayText(): string {
+    return "Writing Tracker";
+  }
+
+  async onOpen(): Promise<void> {
+    const container = this.containerEl.children[1];
+    container.empty();
+    container.createEl("h2", { text: "Writing Tracker" });
+
+    const chartContainer = container.createDiv({ cls: "chart-container" });
+    const chartEl = chartContainer.createEl("canvas");
+    chartEl.style.width = "400px";
+    chartEl.style.height = "400px";
+
+    this.chart = new Chart(chartEl, {
+      type: "pie",
+      data: {
+        labels: Object.keys(this.goals),
+        datasets: [
+          {
+            data: [
+              this.getTotalDailyProgress(),
+              this.getTotalDailyGoal() - this.getTotalDailyProgress(),
+            ],
+            backgroundColor: ["#36a2eb", "#e0e0e0"],
+          },
+        ],
+      },
+      options: {
+        responsive: true,
+        plugins: {
+          legend: {
+            position: "top",
+          },
+          title: {
+            display: true,
+            text: "Daily Progress",
+          },
+        },
+      },
+    });
+
+    const goalsContainer = container.createDiv({
+      cls: "writing-goals-container",
+    });
+    Object.entries(this.goals).forEach(([fileOrFolderPath, goal]) => {
+      this.createGoalElement(goalsContainer, fileOrFolderPath, goal);
+    });
+  }
+
+  private createGoalElement(
+    container: HTMLElement,
+    fileOrFolderPath: string,
+    goal: any,
+  ) {
+    const goalEl = container.createDiv();
+    goalEl.dataset.path = fileOrFolderPath;
+    goalEl.createEl("p", { text: fileOrFolderPath });
+    goalEl.createEl("p", {
+      text: `Daily Goal: ${goal.dailyGoal}, Progress: ${goal.dailyProgress}`,
+      cls: "daily-progress",
+    });
+    goalEl.createEl("p", {
+      text: `Total Goal: ${goal.totalGoal}, Progress: ${goal.totalProgress}`,
+      cls: "total-progress",
+    });
+  }
+
+  private updateGoalElement(fileOrFolderPath: string, goal: any) {
+    const goalEl = this.containerEl.querySelector(
+      `.writing-goals-container [data-path="${fileOrFolderPath}"]`,
+    ) as HTMLElement;
+    if (goalEl) {
+      goalEl.querySelector(".daily-progress").textContent =
+        `Daily Goal: ${goal.dailyGoal}, Progress: ${goal.dailyProgress}`;
+      goalEl.querySelector(".total-progress").textContent =
+        `Total Goal: ${goal.totalGoal}, Progress: ${goal.totalProgress}`;
+    }
+  }
+
+  private onSettingsChanged(goals: { [key: string]: any }) {
+    this.goals = goals;
+    Object.entries(this.goals).forEach(([fileOrFolderPath, goal]) => {
+      this.updateGoalElement(fileOrFolderPath, goal);
+    });
+    this.updateChart();
+  }
+
+  private updateChart() {
+    if (this.chart) {
+      this.chart.data.datasets[0].data = [
+        this.getTotalDailyProgress(),
+        this.getTotalDailyGoal() - this.getTotalDailyProgress(),
+      ];
+      this.chart.update();
+    }
+  }
+
+  private getTotalDailyProgress(): number {
+    return Object.values(this.goals).reduce(
+      (total, goal) => total + goal.dailyProgress,
+      0,
+    );
+  }
+
+  private getTotalDailyGoal(): number {
+    return Object.values(this.goals).reduce(
+      (total, goal) => total + goal.dailyGoal,
+      0,
+    );
+  }
 }
