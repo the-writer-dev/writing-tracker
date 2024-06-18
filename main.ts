@@ -207,13 +207,11 @@ export default class WritingTrakcerPlugin extends Plugin {
   ) {
     if (file instanceof TFile) {
       const content = await this.app.vault.read(file);
-      const currentWordCount = content.trim().split(/\s+/).length;
+      const currentWordCount =
+        content.trim() === "" ? 0 : content.trim().split(/\s+/).length;
+
       const previousWordCount = goal.previousWordCount || goal.initialWordCount;
       const wordCountChange = currentWordCount - previousWordCount;
-      console.log(`File: ${file.path}`);
-      console.log(`Previous Word Count: ${previousWordCount}`);
-      console.log(`Current Word Count: ${currentWordCount}`);
-      console.log(`Word Count Change: ${wordCountChange}`);
 
       if (folderPath) {
         const filesInFolder = this.app.vault
